@@ -1,0 +1,187 @@
+#------------------------------------------------------------------------------#
+#                           SIMULATION PARAMETERS                              #
+#------------------------------------------------------------------------------#
+# --- Temperature, Time, & Deletion ---
+variable Tinit      equal 5
+variable Tmain      equal 1650
+variable del_freq   equal 1000
+variable npt_ramp_steps  equal 4000
+variable npt_hold_steps equal 6000
+variable nvt_hold_steps equal 8000000
+variable loop_cnt   equal round(${nvt_hold_steps}/${del_freq})
+variable sub_fraction equal 0.25
+
+# --- Geometry Dimensions ---
+variable lat        equal 4.3794729
+variable xmax equal 15.999  
+variable ymax equal 15.999 
+variable zmax equal 19.249
+variable xmin equal -0.001
+variable ymin equal -0.001 
+variable zmin equal -0.749
+variable lower_terrace_l equal 4  
+variable facet_h equal 2
+variable vacuum_pad equal 3.00
+variable sic_zmax equal (${zmax}-${vacuum_pad})  
+variable sic_zmin equal (${zmin}+1.000)
+variable frozen_t equal 1.000
+variable active_zmin equal (${sic_zmin}+${frozen_t})
+variable surf_width equal 3.00
+
+# Derived Geometry Variables
+variable trap_xmin  equal (${xmax}/2)-(${lower_terrace_l}/2)
+variable trap_xmax  equal (${xmax}/2)+(${lower_terrace_l}/2)
+variable surf_min   equal ${sic_zmax}-${surf_width}
+variable trap_min   equal ${sic_zmax}-${facet_h}
+
+#------------------------------------------------------------------------------#
+#                       INITIALIZATION & ATOM CREATION                         #
+#------------------------------------------------------------------------------#
+units       metal
+dimension   3
+boundary    p p p
+atom_style  atomic
+lattice     fcc ${lat}
+
+# Create Box
+region      box prism ${xmin} ${xmax} ${ymin} ${ymax} ${zmin} ${zmax} 0 0 0
+create_box  2 box
+
+# Create Atoms (SiC)
+# Basis 1: C (Mass 12.01)
+lattice     custom ${lat} a1 0 0.5 0.5 a2 0.5 0 0.5 a3 0.5 0.5 0 basis 0.25 0.25 0.25
+region      sic_region prism ${xmin} ${xmax} ${ymin} ${ymax} ${sic_zmin} ${sic_zmax} 0 0 0
+create_atoms 1 region sic_region
+mass        1 12.0107 
+
+# Basis 2: Si (Mass 28.01)
+lattice     custom ${lat} a1 0 0.5 0.5 a2 0.5 0 0.5 a3 0.5 0.5 0 basis 0.0 0.0 0.0
+create_atoms 2 region sic_region
+mass        2 28.015
+
+#------------------------------------------------------------------------------#
+#                       GEOMETRY SCULPTING (The Step)                          #
+#------------------------------------------------------------------------------#
+# Define the Step Cuts (Left and Right slopes)
+region cut_L prism ${trap_xmin} ${trap_xmax} ${ymin} ${ymax} ${trap_min} ${sic_zmax} 0 ${facet_h} 0
+region cut_R prism ${trap_xmin} ${trap_xmax} ${ymin} ${ymax} ${trap_min} ${sic_zmax} 0 -${facet_h} 0
+region step_cut union 2 cut_L cut_R
+delete_atoms region step_cut
+
+#------------------------------------------------------------------------------#
+#                        GROUPS & REGIONS DEFINITIONS                          #
+#------------------------------------------------------------------------------#
+# 1. Active vs Fixed
+# Fixed is bottom substrate, Active is everything else
+region      active_reg prism ${xmin} ${xmax} ${ymin} ${ymax} ${active_zmin} ${sic_zmax} 0 0 0
+group       active_region region active_reg
+group       fixed_region subtract all active_region
+
+# 2. Surface vs Bulk
+variable    s_trap_xmin equal ${trap_xmin}-${surf_width}
+variable    s_trap_xmax equal ${trap_xmax}+${surf_width}
+variable    s_trap_zmin equal ${trap_min}-${surf_width}
+variable    s_trap_zmax equal ${sic_zmax}-${surf_width}
+
+region      rect_surf  prism ${xmin} ${xmax} ${ymin} ${ymax} ${surf_min} ${sic_zmax} 0 0 0
+region      left_surf  prism ${s_trap_xmin} ${s_trap_xmax} ${ymin} ${ymax} ${s_trap_zmin} ${s_trap_zmax} 0 ${facet_h} 0
+region      right_surf prism ${s_trap_xmin} ${s_trap_xmax} ${ymin} ${ymax} ${s_trap_zmin} ${s_trap_zmax} 0 -${facet_h} 0
+region      surface_reg union 3 left_surf right_surf rect_surf
+
+group       surface region surface_reg
+group       bulk subtract active_region surface
+
+# 3. Type Groups
+group       Si_atoms type 2
+group       C_atoms type 1
+
+#------------------------------------------------------------------------------#
+#                        POTENTIALS & COMPUTES                                 #
+#------------------------------------------------------------------------------#
+pair_style      uf3 3
+pair_coeff      * * /blue/subhash/michaelmacisaac/SiC/uf3pots/final_SiC_model/CSi.uf3 C Si
+neighbor        2.0 bin
+neigh_modify    delay 10 check yes
+timestep        0.001
+
+# Essential Computes for Thermo Output
+compute         KE all ke/atom
+compute         PE all pe/atom
+compute         tcom all temp/com
+compute         P all stress/atom tcom
+compute         C_neigh Si_atoms coord/atom cutoff 2.75 group C_atoms
+
+# Computes for Region Temperatures
+compute         active_temp active_region temp
+compute         surface_temp surface temp
+compute         bulk_temp bulk temp
+
+#------------------------------------------------------------------------------#
+#                           EQUILIBRATION                                      #
+#------------------------------------------------------------------------------#
+thermo_style    custom step pe etotal press vol temp lx ly lz
+thermo          10
+min_style       cg
+minimize        1e-5 1e-5 5000 10000
+reset_timestep  0
+
+# Dump Initial State
+dump            initial all custom 1 initial.script id type x y z
+run 0
+undump          initial
+
+# Initial Velocity & Fixed Substrate
+velocity        active_region create ${Tinit} 2000 dist gaussian
+fix             frozen fixed_region nve
+fix             frozen_force fixed_region setforce 0.0 0.0 0.0
+
+# --- RESTORED THERMO OUTPUT ---
+thermo_style    custom step temp c_active_temp c_bulk_temp c_surface_temp etotal press pxx pyy pzz vol lx ly lz
+thermo_modify   lost warn flush yes
+thermo          100
+
+# 1. Ramp
+dump            runup all custom 1000 runup.script id type x y z c_KE c_PE c_C_neigh 
+dump            surface surface custom 1000 surface.script id type x y z c_KE c_PE c_C_neigh 
+fix             npt_ramp active_region npt temp ${Tinit} ${Tmain} 0.1 x 0.0 0.0 100.0 y 0.0 0.0 100.0
+fix_modify      npt_ramp temp active_temp
+run             ${npt_ramp_steps}
+
+# 2. Hold (Switch to stricter barostat settings)
+unfix           npt_ramp
+fix             npt_hold active_region npt temp ${Tmain} ${Tmain} 0.1 x 0.0 0.0 2.0 y 0.0 0.0 2.0 drag 2.0
+fix_modify      npt_hold temp active_temp
+run             ${npt_hold_steps}
+unfix           npt_hold
+undump          runup
+
+#------------------------------------------------------------------------------#
+#                       PRODUCTION LOOP (Sublimation)                          #
+#------------------------------------------------------------------------------#
+dump            prod all custom 5000 prodhold.script id type x y z fx fy fz c_KE c_PE c_C_neigh
+restart         20000 restart.*.equil
+
+# Variable for deletion logic (True if Type 2 AND High PE AND Low Coord)
+
+variable i loop ${loop_cnt}
+label main_loop
+    # Dynamics
+    fix         nvt_run bulk nvt temp ${Tmain} ${Tmain} 0.1
+    fix_modify  nvt_run temp bulk_temp
+    fix         surf_nve surface nve
+    
+    run         ${del_freq}
+    
+    unfix       nvt_run
+    unfix       surf_nve
+    #Atom deletion
+    variable should_del atom "(type==2) && (c_PE > -4.0) && (c_C_neigh < 1)"
+    group    sublime_silicons variable should_del
+    variable delete_count equal round(${sub_fraction}*count(sublime_silicons))
+    delete_atoms random count ${delete_count} yes sublime_silicons NULL 1000    
+
+next i
+jump SELF main_loop
+
+undump prod
+undump surface
